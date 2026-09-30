@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# srcapp 0.1.0 — mini package manager for non-apt apps (tarball / source / cmd).
+# Usage:
+#   srcapp add tar  <name> <url> [bin...] [--tag user|system]
+#   srcapp add cmd  <name> '<update-cmd>' '<uninstall-cmd>' [--ver '<version-cmd>'] [--tag user|system]
+#   srcapp update   <name> [url]
+#   srcapp update   all          # user-tagged apps only (no sudo)
+#   srcapp remove   <name>
+#   srcapp list     [name]
+set -uo pipefail
+
+CAT="$HOME/.config/srcapp"
+ROOT="$HOME/.local/share/srcapp"
+BINDIR="$HOME/.local/bin"
+
+mkdir -p "$CAT" "$ROOT" "$BINDIR"
+
+die() { echo "srcapp: ERROR: $*" >&2; exit 1; }
+info() { echo "srcapp: $*"; }
+
+require() { command -v "$1" >/dev/null 2>&1 || die "requires '$1' (apt install $1)"; }
+
+conf_path()  { echo "$CAT/$1.conf"; }
+stage_dir()  { echo "$ROOT/$1"; }
+curr()       { cat "$(stage_dir "$1")/CURRENT" 2>/dev/null || true; }
+
+load_conf() {
+    local f=$(conf_path "$1")
+    [ -f "$f" ] || die "app '$1' is not in the catalog (see: srcapp list)"
+    unset METHOD URL BIN UP UN VER TAG
+    local line k v
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [ -z "$line" ] && continue
+        k="${line%%=*}"; v="${line#*=}"
+        case "$k" in METHOD) METHOD="$v";; URL) URL="$v";;
+        BIN) BIN="$v";; UP) UP="$v";; UN) UN="$v";;
+        VER) VER="$v";; TAG) TAG="$v";; esac
+    done < "$f"
+    METHOD=${METHOD:-cmd}; TAG=${TAG:-user}
+}
+
+slugify() { printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-'; }
+
+probe_version() {
+    local bin="$1"
+    local out v
+    out=$("$bin" --version 2>/dev/null || "$bin" -V 2>/dev/null || true)
+    v=$(printf '%s\n' "$out" | head -1 | tr ' ' '-')
+    slugify "${v:-manual-$(date +%Y%m%d-%H%M%S)}"
+}
+
+link_bins() {
+    local name="$1" slug="$2" b t
+    for b in $BIN; do
+        t=$(find "$(stage_dir "$name")/$slug" -type f -name "$b" -perm -u+x | head -1)
+        [ -n "$t" ] || die "binary '$b' not found in the download of $name"
+        ln -sfn "$t" "$BINDIR/$b" || die "failed to create symlink $BINDIR/$b"
+    done
+}
+
+install_tar() {
+    local name="$1" url="$2"
+    require curl; require tar
+    local tmp prev tarflags fb
+    local fname=${url##*/}
+    case "$fname" in
+        *.tar.gz|*.tgz) tarflags=-xzf ;;
+        *.tar.xz)       tarflags=-xJf ;;
+        *.tar.bz2)      tarflags=-xjf ;;
+        *.zip) die "zip format is not supported; use a tarball" ;;
+        *)              tarflags=-xzf ;;
+    esac
+    [ -d "$(stage_dir "$name")" ] || mkdir -p "$(stage_dir "$name")"
+    tmp=$(mktemp -d)
+    case "$url" in
+        http://*|https://*) curl -fL --retry 2 "$url" -o "$tmp/pkg.tgz" || { rm -rf "$tmp"; die "download failed: $url"; } ;;
+        *) [ -r "$url" ] || { rm -rf "$tmp"; die "file not found: $url"; }; cp "$url" "$tmp/pkg.tgz" ;;
+    esac
+    mkdir -p "$tmp/x"
+    tar "$tarflags" "$tmp/pkg.tgz" -C "$tmp/x" . || { rm -rf "$tmp"; die "extraction failed (wrong url?)"; }
+    # probe via the first binary found
+    local slug=""
+    local first
+    first=$(find "$tmp/x" -type f -name "*.sh" -prune -o -type f -perm -u+x -print | head -1)
+    if [ -n "$first" ] && [ -z "$BIN" ]; then
+        slug=$(probe_version "$first")
+    elif [ -n "$BIN" ]; then
+        fb=$(find "$tmp/x" -type f -name "${BIN%% *}" -perm -u+x | head -1)
+        [ -n "$fb" ] && slug=$(probe_version "$fb")
+    fi
+    [ -n "$slug" ] || slug="manual-$(date +%Y%m%d-%H%M%S)"
+    prev=$(curr "$name")
+    rm -rf "$(stage_dir "$name")/$slug"   # reinstalling the same version: clear it so it does not nest as <slug>/x/
+    mv "$tmp/x" "$(stage_dir "$name")/$slug"
+    if [ -n "$BIN" ]; then
+        link_bins "$name" "$slug"
+    fi
+    printf '%s' "$slug" > "$(stage_dir "$name")/CURRENT"
+    rm -rf "$tmp"
+    info "$name: installed version '$slug'"
+    [ -n "$prev" ] && [ "$prev" != "$slug" ] && rm -rf "$(stage_dir "$name")/$prev"
+}
+
+add_tar() {
+    local name="$1" url="$2"; shift 2
+    local tag=user; local bin=""
+    while [ $# -gt 0 ]; do
+        case "$1" in --tag) tag="$2"; shift 2 ;; *) bin="$bin $1"; shift ;; esac
+    done
+    BIN=$(printf '%s' "$bin" | sed 's/^ //')
+    install_tar "$name" "$url"
+    {
+        printf '# created by srcapp add tar\n'
+        printf 'METHOD=tar\nTAG=%s\nURL=%s\n' "$tag" "$url"
+        [ -n "$BIN" ] && printf 'BIN=%s\n' "$BIN"
+    } > "$(conf_path "$name")"
+    info "$name: added to catalog"
+}
+
+add_cmd() {
+    local name="$1" up="$2" un="$3"; shift 3
+    local tag=user ver=""
+    while [ $# -gt 0 ]; do
+        case "$1" in --tag) tag="$2"; shift 2 ;; --ver) ver="$2"; shift 2 ;; *) die "unknown argument: $1" ;; esac
+    done
+    { printf '# created by srcapp add cmd\n'
+      printf 'METHOD=cmd\nTAG=%s\nUP=%s\nUN=%s\n' "$tag" "$up" "$un"
+      [ -n "$ver" ] && printf 'VER=%s\n' "$ver"
+    } > "$(conf_path "$name")"
+    info "$name: added to catalog (cmd). Run 'srcapp update $name' for the first install."
+}
+
+update_one() {
+    local name="$1" newurl="${2:-}" oldurl=""
+    load_conf "$name"
+    case "$METHOD" in
+        tar)
+            oldurl="$URL"
+            [ -n "$newurl" ] && URL="$newurl"
+            install_tar "$name" "$URL"
+            if [ -n "$newurl" ] && [ "$newurl" != "$oldurl" ]; then
+                sed -i "s|^URL=.*|URL=$newurl|" "$(conf_path "$name")"
+            fi
+            ;;
+        cmd)
+            [ -n "$UP" ] || die "$name: no UP command"
+            info "$name: running update command..."
+            eval "$UP" || die "$name: update command failed (exit $?)"
+            info "$name: update done"
+            ;;
+    esac
+}
+
+update_all() {
+    local f n
+    for f in "$CAT"/*.conf; do
+        [ -f "$f" ] || continue
+        n=$(basename "$f" .conf)
+        case "$(grep -oP '^TAG=\K.*' "$f" 2>/dev/null)" in
+            system) info "skipping $n (system, update manually: srcapp update $n)" ;;
+            *) update_one "$n" ;;
+        esac
+    done
+}
+
+remove_one() {
+    local name="$1"
+    load_conf "$name"
+    case "$METHOD" in
+        tar)
+            local b t
+            for b in $BIN; do
+                [ -e "$BINDIR/$b" ] && rm -f "$BINDIR/$b"
+            done
+            rm -rf "$(stage_dir "$name")"
+            ;;
+        cmd)
+            if [ -n "$UN" ]; then
+                info "$name: running uninstall command..."
+                eval "$UN" || die "$name: uninstall command failed"
+            else
+                info "$name: no UN command — remove it manually."
+            fi
+            ;;
+    esac
+    rm -f "$(conf_path "$name")"
+    info "$name: removed"
+}
+
+list_one() {
+    local name="$1"
+    load_conf "$name"
+    local v="?"
+    if [ -n "${VER:-}" ]; then
+        v=$(eval "${VER//\$name/$name}" 2>/dev/null | head -1) || v="?"
+    elif [ "$METHOD" = tar ]; then
+        local c; c=$(curr "$name"); v="${c:-?}"
+    fi
+    printf '%-16s %-5s %-6s bin=[%s] ver=%s\n' "$name" "$METHOD" "$TAG" "${BIN:-'-'}" "$v"
+}
+
+cmd="${1:-list}"
+case "$cmd" in
+    add) shift; case "${1:-}" in
+            tar)  shift; [ $# -ge 2 ] || die "usage: srcapp add tar <name> <url> [bin...]"; add_tar "$@";;
+            cmd)  shift; [ $# -ge 3 ] || die "usage: srcapp add cmd <name> '<up>' '<un>'"; add_cmd "$@";;
+            *) die "method must be 'tar' or 'cmd'";;
+         esac ;;
+    update)
+        shift
+        if [ "${1:-}" = "all" ]; then update_all; elif [ $# -ge 1 ]; then update_one "$1" "${2:-}"; else die "usage: srcapp update <name|all>"; fi ;;
+    remove) shift; [ $# -ge 1 ] || die "usage: srcapp remove <name>"; remove_one "$1" ;;
+    list) shift; if [ $# -ge 1 ]; then list_one "$1"; else
+        for f in "$CAT"/*.conf; do [ -f "$f" ] && list_one "$(basename "$f" .conf)"; done
+        fi ;;
+    *) die "usage: srcapp {add tar|add cmd, update, remove, list}" ;;
+esac

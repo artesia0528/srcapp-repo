@@ -1,0 +1,6 @@
+# katalog lokal — jangan pernah di-commit (path & command pribadi)
+*.conf
+updates/
+
+# backup
+*.bak
