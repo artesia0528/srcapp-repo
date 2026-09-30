@@ -10,7 +10,7 @@ jadi tidak perlu mengingat lagi cara install/update masing-masing tool.
 `srcapp` satu file bash tanpa dependency. Cukup taruh di `PATH`:
 
 ```bash
-git clone https://github.com/<user>/srcapp.git
+git clone https://github.com/artesia0528/srcapp-repo.git
 install -Dm755 srcapp-repo/srcapp ~/.local/bin/srcapp
 srcapp list            # katalog kosong — normal
 ```

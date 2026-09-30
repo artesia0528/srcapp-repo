@@ -24,6 +24,9 @@ make_pkg() {
     tar -czf "$WORK/demo-$ver.tar.gz" -C "$d" .
 }
 
+echo "0. list on an empty catalog must exit 0"
+HOME="$FAKE" "$SRCAPP" list >/dev/null 2>&1 && ok "empty catalog exits 0" || fail "empty catalog exits non-zero (breaks 'srcapp list && ...')"
+
 echo "1. add tar (version 1.0.0)"
 make_pkg 1.0.0
 HOME="$FAKE" "$SRCAPP" add tar demo "$WORK/demo-1.0.0.tar.gz" demo >/dev/null || fail "add tar failed"

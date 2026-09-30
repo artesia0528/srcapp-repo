@@ -212,7 +212,7 @@ case "$cmd" in
         if [ "${1:-}" = "all" ]; then update_all; elif [ $# -ge 1 ]; then update_one "$1" "${2:-}"; else die "usage: srcapp update <name|all>"; fi ;;
     remove) shift; [ $# -ge 1 ] || die "usage: srcapp remove <name>"; remove_one "$1" ;;
     list) shift; if [ $# -ge 1 ]; then list_one "$1"; else
-        for f in "$CAT"/*.conf; do [ -f "$f" ] && list_one "$(basename "$f" .conf)"; done
+        for f in "$CAT"/*.conf; do if [ -f "$f" ]; then list_one "$(basename "$f" .conf)"; fi; done
         fi ;;
     *) die "usage: srcapp {add tar|add cmd, update, remove, list}" ;;
 esac
